@@ -20,16 +20,19 @@
 
 import os
 import re
+import shutil
 
 
 DOCUMENTATION = '''
 ---
 module: sudoers
-author: Alberto Re
-version_added: 1.7.2
+author: Alberto Re <alberto.re@gmail.com>
+version_added: 1.8
 short_description: manage sudoers on system
 description:
     - Add/remove users and groups from sudoers
+    - Honouring visudo lock file and do sanity checks (visudo -cf ) before
+      committing changes to the system, reverting if any is detected
 options:
     name:
         required: true
@@ -78,13 +81,33 @@ EXAMPLES = '''
 '''
 
 SUDOERS_PATH='/etc/sudoers'
+SUDOERS_TMP_PATH='/etc/sudoers.tmp'
 
 class Sudoers(object):
-    def __init__(self, name, kind, host, password_required):
+
+    def __init__(self, name, kind, host, password_required,
+                 commands):
         self.name = name
         self.kind = kind
         self.host = host
         self.password_required = password_required
+        self.commands = commands
+
+    def lock(self):
+        if os.path.isfile(SUDOERS_TMP_PATH):
+            raise IOError()
+        # shutil also throws an IOError
+        shutil.copyfile(SUDOERS_PATH, SUDOERS_TMP_PATH)
+        os.chmod(SUDOERS_TMP_PATH, 0440)
+
+    def rollback(self):
+        os.remove(SUDOERS_TMP_PATH)
+
+    def commit(self):
+        if os.system('visudo -c -f %s' % SUDOERS_TMP_PATH) != 0:
+            raise Exception('invalid syntax detected')
+
+        shutil.move(SUDOERS_TMP_PATH, SUDOERS_PATH)
 
     def get_large_pattern(self):
         if self.kind == 'user':
@@ -105,7 +128,7 @@ class Sudoers(object):
         if not self.password_required:
             pattern += ' NOPASSWD:'
 
-        pattern += ' ALL$'
+        pattern += ' %s$' % self.commands
         return pattern
 
     def readlines(self):
@@ -114,44 +137,38 @@ class Sudoers(object):
         f.close()
         return lines
 
-    def kind_listed(self, exactly=False):
-        try:
-            lines = self.readlines()
-        except IOError:
-            module.fail_json(msg="%s is missing or not readable" % SUDOERS_PATH)       
-        if exactly:
-            pattern = self.get_strict_pattern()
-            print 'strict pattern: %s' % pattern
-        else:
-            pattern = self.get_large_pattern()
-            print 'large pattern: %s' % pattern
+    def is_listed(self):
+        (listed, listed_exactly) = (False, False)
+        lines = self.readlines()
+        large_pattern = self.get_large_pattern()
+        strict_pattern = self.get_strict_pattern()
 
         for line in lines:
             stripped = line.strip()
             if stripped.startswith('#'):
                 continue
 
-            if re.match(pattern, stripped):
-                return True
+            if re.match(strict_pattern, stripped):
+                listed = True
+                listed_exactly = True
+            elif re.match(large_pattern, stripped):
+                listed = True
 
-        return False
+        return (listed, listed_exactly)
 
     def remove_user(self):
         lines = self.readlines()
         pattern = self.get_large_pattern()
 
-        try:
-            f = open(SUDOERS_PATH, 'w')
+        f = open(SUDOERS_TMP_PATH, 'w')
 
-            for line in lines:
-                if not re.match(pattern, line.strip()):
-                    f.write(line)
-            f.close()
-        except IOError:
-            module.fail_json(msg="%s is not writable" % SUDOERS_PATH)       
+        for line in lines:
+            if not re.match(pattern, line.strip()):
+                f.write(line)
+        f.close()
 
     def add_user(self):
-        f = open(SUDOERS_PATH, 'a')
+        f = open(SUDOERS_TMP_PATH, 'a')
         if self.kind == 'user':
             entry = '%s' % self.name
         elif self.kind == 'group':
@@ -162,7 +179,7 @@ class Sudoers(object):
         if not self.password_required:
             entry += ' NOPASSWD:'
 
-        entry += ' ALL\n'
+        entry += ' %s\n' % self.commands
         f.write(entry)
         f.close()
 
@@ -170,13 +187,14 @@ class Sudoers(object):
 def main():
     module = AnsibleModule(
         argument_spec=dict(
-            name=dict(required=False),
-            group=dict(required=False),
-            host=dict(required=False, default='ALL'),
+            name=dict(required=False, type='str', aliases=['user']),
+            group=dict(required=False, type='str'),
+            host=dict(required=False, default='ALL', type='str'),
+            commands=dict(required=False, default='ALL', type='str'),
             state=dict(required=False, choices=['present', 'absent'],
-                       default='present'),
-            backup=dict(required=False, default=False),
-            password_required=dict(required=False, default=True)
+                       default='present', type='str'),
+            backup=dict(required=False, default='no', type='bool'),
+            password_required=dict(required=False, default='yes', type='bool')
         ),
         supports_check_mode=False,
         required_one_of=[['name', 'group']],
@@ -186,33 +204,71 @@ def main():
     args = dict(changed=False, failed=False,
                 name=module.params['name'], state=module.params['state'],
                 group=module.params['group'], backup=module.params['backup'],
-                host=module.params['host'], nopasswd=module.params['password_required'])
+                host=module.params['host'], password_required=module.params['password_required'],
+                commands=module.params['commands'])
 
     if args['name']:
-        sudoers = Sudoers(args['name'], kind='user', host=args['host'], password_required=args['nopasswd'])
+        sudoers = Sudoers(args['name'], kind='user', host=args['host'],
+                          password_required=args['password_required'],
+                          commands=args['commands'])
     elif args['group']:
-        sudoers = Sudoers(args['group'], kind='group', host=args['host'], password_required=args['nopasswd'])
+        sudoers = Sudoers(args['group'], kind='group', host=args['host'],
+                          password_required=args['password_required'],
+                          commands=args['commands'])
 
-    is_listed = sudoers.kind_listed()
-    is_listed_exactly= sudoers.kind_listed(True)
+    (listed, listed_exactly) = sudoers.is_listed()
 
-    if is_listed and args['state'] == 'absent':
+    if listed and args['state'] == 'absent':
+        try:
+            sudoers.lock()
+        except IOError:
+            module.fail_json(msg="sudoers is locked by another user")
+
         if args['backup']:
             module.backup_local(SUDOERS_PATH)
-        sudoers.remove_user()
-        args['changed'] = True
-    elif is_listed and not is_listed_exactly and args['state'] == 'present':
-        # to be optimized
+
+        try:
+            sudoers.remove_user()
+            sudoers.commit()
+            args['changed'] = True
+        except Exception, ex:
+            sudoers.rollback()
+            module.fail_json(msg="commit failed: %s" % str(ex))
+
+    elif listed and not listed_exactly and args['state'] == 'present':
+        try:
+            sudoers.lock()
+        except IOError:
+            module.fail_json(msg="sudoers is locked by another user")
+
         if args['backup']:
             module.backup_local(SUDOERS_PATH)
-        sudoers.remove_user()
-        sudoers.add_user()
-        args['changed'] = True
-    elif not is_listed and args['state'] == 'present':
+
+        try:
+            sudoers.remove_user()
+            sudoers.add_user()
+            sudoers.commit()
+            args['changed'] = True
+        except Exception, ex:
+            sudoers.rollback()
+            module.fail_json(msg="commit failed: %s" % str(ex))
+
+    elif not listed and args['state'] == 'present':
+        try:
+            sudoers.lock()
+        except IOError:
+            module.fail_json(msg="sudoers is locked by another user")
+
         if args['backup']:
             module.backup_local(SUDOERS_PATH)
-        sudoers.add_user()
-        args['changed'] = True
+
+        try:
+            sudoers.add_user()
+            sudoers.commit()
+            args['changed'] = True
+        except Exception, ex:
+            sudoers.rollback()
+            module.fail_json(msg="commit failed: %s" % str(ex))
 
     module.exit_json(**args)
 
