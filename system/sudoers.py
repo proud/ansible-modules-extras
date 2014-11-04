@@ -80,10 +80,15 @@ EXAMPLES = '''
 
 '''
 
-SUDOERS_PATH='/etc/sudoers'
-SUDOERS_TMP_PATH='/etc/sudoers.tmp'
-
 class Sudoers(object):
+    """Basic class for sudoers manipulation
+    """
+
+    platform = 'Generic'
+    distribution = None
+
+    def __new__(cls, *args, **kwargs):
+        return load_platform_subclass(Sudoers, args, kwargs)
 
     def __init__(self, name, kind, host, password_required,
                  commands):
@@ -92,22 +97,27 @@ class Sudoers(object):
         self.host = host
         self.password_required = password_required
         self.commands = commands
+        self.set_platform_specific_paths()
+
+    def set_platform_specific_paths(self):
+        self.sudoers_path = '/etc/sudoers'
+        self.sudoers_tmp_path = '/etc/sudoers.tmp'
 
     def lock(self):
-        if os.path.isfile(SUDOERS_TMP_PATH):
+        if os.path.isfile(self.sudoers_tmp_path):
             raise IOError()
         # shutil also throws an IOError
-        shutil.copyfile(SUDOERS_PATH, SUDOERS_TMP_PATH)
-        os.chmod(SUDOERS_TMP_PATH, 0440)
+        shutil.copyfile(self.sudoers_path, self.sudoers_tmp_path)
+        os.chmod(self.sudoers_tmp_path, 0440)
 
     def rollback(self):
-        os.remove(SUDOERS_TMP_PATH)
+        os.remove(self.sudoers_tmp_path)
 
     def commit(self):
-        if os.system('visudo -c -f %s' % SUDOERS_TMP_PATH) != 0:
+        if os.system('visudo -c -f %s' % self.sudoers_tmp_path) != 0:
             raise Exception('invalid syntax detected')
 
-        shutil.move(SUDOERS_TMP_PATH, SUDOERS_PATH)
+        shutil.move(self.sudoers_tmp_path, self.sudoers_path)
 
     def get_large_pattern(self):
         if self.kind == 'user':
@@ -132,7 +142,7 @@ class Sudoers(object):
         return pattern
 
     def readlines(self):
-        f = open(SUDOERS_PATH, 'r')
+        f = open(self.sudoers_path, 'r')
         lines = f.readlines()
         f.close()
         return lines
@@ -160,7 +170,7 @@ class Sudoers(object):
         lines = self.readlines()
         pattern = self.get_large_pattern()
 
-        f = open(SUDOERS_TMP_PATH, 'w')
+        f = open(self.sudoers_tmp_path, 'w')
 
         for line in lines:
             if not re.match(pattern, line.strip()):
@@ -168,7 +178,7 @@ class Sudoers(object):
         f.close()
 
     def add_user(self):
-        f = open(SUDOERS_TMP_PATH, 'a')
+        f = open(self.sudoers_tmp_path, 'a')
         if self.kind == 'user':
             entry = '%s' % self.name
         elif self.kind == 'group':
@@ -182,6 +192,17 @@ class Sudoers(object):
         entry += ' %s\n' % self.commands
         f.write(entry)
         f.close()
+
+class FreeBsdSudoers(Sudoers):
+    """FreeBSD specific class
+    """
+
+    platform = 'FreeBSD'
+    distribution = None
+
+    def set_platform_specific_paths(self):
+        self.sudoers_path = '/usr/local/etc/sudoers'
+        self.sudoers_tmp_path = '/usr/local/etc/sudoers.tmp'
 
 
 def main():
@@ -225,7 +246,7 @@ def main():
             module.fail_json(msg="sudoers is locked by another user")
 
         if args['backup']:
-            module.backup_local(SUDOERS_PATH)
+            module.backup_local(sudoers.sudoers_path)
 
         try:
             sudoers.remove_user()
@@ -242,7 +263,7 @@ def main():
             module.fail_json(msg="sudoers is locked by another user")
 
         if args['backup']:
-            module.backup_local(SUDOERS_PATH)
+            module.backup_local(sudoers.sudoers_path)
 
         try:
             sudoers.remove_user()
@@ -260,7 +281,7 @@ def main():
             module.fail_json(msg="sudoers is locked by another user")
 
         if args['backup']:
-            module.backup_local(SUDOERS_PATH)
+            module.backup_local(sudoers.sudoers_path)
 
         try:
             sudoers.add_user()
