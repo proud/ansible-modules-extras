@@ -28,16 +28,22 @@ DOCUMENTATION = '''
 module: sudoers
 author: Alberto Re <alberto.re@gmail.com>
 version_added: 1.8
-short_description: manage sudoers on system
+short_description: basic management of sudoers configuration
 description:
     - Add/remove users and groups from sudoers
-    - Honouring visudo lock file and do sanity checks (visudo -cf ) before
-      committing changes to the system, reverting if any is detected
+    - Compatible with visudo (8) locking
+    - Basic sanity checks (visudo -cf ) are done before writing changes
+    - Could operate on the main sudoers file (if you feel brave) or in a
+      custom one under sudoers.d
 options:
     name:
-        required: true
+        required: false
         description:
             - Name of the user to add or edit
+    group:
+        required: false
+        description:
+            - Name of the group to add or edit
     state:
         required: false
         default: "present"
@@ -45,6 +51,12 @@ options:
         description:
             - Whether the entry should exist.  When C(absent), removes
               the sudoers entry.
+    host:
+        required: false
+        default: "ALL"
+        description:
+            - Host from which commands are allower for the user (or group).
+              Could be an alias or a valid host(s) definition
     password_required:
         required: false
         default: yes
@@ -58,6 +70,12 @@ options:
         description:
             - Create a backup file including the timestamp information so you can get
               the original file back if you somehow clobbered it incorrectly.
+    cfg_file:
+        required: false
+        default: null
+        description:
+            - the name of the file under the sudoers.d directory to edit in
+              place of the main configuration file
 requirements: []
 '''
 
@@ -91,17 +109,21 @@ class Sudoers(object):
         return load_platform_subclass(Sudoers, args, kwargs)
 
     def __init__(self, name, kind, host, password_required,
-                 commands):
+                 commands, cfg_file):
         self.name = name
         self.kind = kind
         self.host = host
         self.password_required = password_required
         self.commands = commands
+        self.cfg_file = cfg_file
         self.set_platform_specific_paths()
+        if self.cfg_file:
+            self.sudoers_path = '%s/%s' % (self.sudoers_dir_path, self.cfg_file)
+        self.sudoers_tmp_path = '%s.tmp' % self.sudoers_path
 
     def set_platform_specific_paths(self):
         self.sudoers_path = '/etc/sudoers'
-        self.sudoers_tmp_path = '/etc/sudoers.tmp'
+        self.sudoers_dir_path = '/etc/sudoers.d'
 
     def lock(self):
         if os.path.isfile(self.sudoers_tmp_path):
@@ -147,8 +169,19 @@ class Sudoers(object):
         f.close()
         return lines
 
+    def create_cfg_file(self):
+        f = open(self.sudoers_path, 'w')
+        f.close()
+
     def is_listed(self):
         (listed, listed_exactly) = (False, False)
+
+        if self.cfg_file:
+            if not os.path.isfile(self.sudoers_tmp_path):
+                self.create_cfg_file()
+            else:
+                raise('%s is missing' % self.cfg_file)
+
         lines = self.readlines()
         large_pattern = self.get_large_pattern()
         strict_pattern = self.get_strict_pattern()
@@ -202,7 +235,7 @@ class FreeBsdSudoers(Sudoers):
 
     def set_platform_specific_paths(self):
         self.sudoers_path = '/usr/local/etc/sudoers'
-        self.sudoers_tmp_path = '/usr/local/etc/sudoers.tmp'
+        self.sudoers_dir_path = '/usr/local/etc/sudoers.d'
 
 
 def main():
@@ -215,7 +248,8 @@ def main():
             state=dict(required=False, choices=['present', 'absent'],
                        default='present', type='str'),
             backup=dict(required=False, default='no', type='bool'),
-            password_required=dict(required=False, default='yes', type='bool')
+            password_required=dict(required=False, default='yes', type='bool'),
+            cfg_file=dict(required=False, default=None, type='str')
         ),
         supports_check_mode=False,
         required_one_of=[['name', 'group']],
@@ -226,18 +260,21 @@ def main():
                 name=module.params['name'], state=module.params['state'],
                 group=module.params['group'], backup=module.params['backup'],
                 host=module.params['host'], password_required=module.params['password_required'],
-                commands=module.params['commands'])
+                commands=module.params['commands'], cfg_file=module.params['cfg_file'])
 
     if args['name']:
         sudoers = Sudoers(args['name'], kind='user', host=args['host'],
                           password_required=args['password_required'],
-                          commands=args['commands'])
+                          commands=args['commands'], cfg_file=args['cfg_file'])
     elif args['group']:
         sudoers = Sudoers(args['group'], kind='group', host=args['host'],
                           password_required=args['password_required'],
-                          commands=args['commands'])
+                          commands=args['commands'], cfg_file=args['cfg_file'])
 
-    (listed, listed_exactly) = sudoers.is_listed()
+    try:
+        (listed, listed_exactly) = sudoers.is_listed()
+    except Exception, ex:
+        module.fail_json(msg="sudoers file is missing, detailed error: %s" % str(ex))
 
     if listed and args['state'] == 'absent':
         try:
